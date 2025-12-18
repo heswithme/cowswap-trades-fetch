@@ -1,7 +1,11 @@
 """
-Fetch historical WBTC<->stablecoin trades from CoW Protocol subgraph.
+Fetch historical trades from CoW Protocol subgraph.
 
-Usage: uv run fetch_trades.py [USDT|USDC|ALL]
+Usage: uv run fetch_trades.py <BASE> <QUOTE>
+       uv run fetch_trades.py WBTC          # WBTC vs USDT+USDC
+       uv run fetch_trades.py WETH          # WETH vs USDT+USDC
+       uv run fetch_trades.py ETH           # native ETH vs USDT+USDC
+       uv run fetch_trades.py WETH USDT     # specific pair
 """
 
 import csv
@@ -24,6 +28,8 @@ SUBGRAPH_URL = (
 
 TOKENS = {
     "WBTC": {"address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", "decimals": 8},
+    "WETH": {"address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "decimals": 18},
+    "ETH": {"address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "decimals": 18},
     "USDT": {"address": "0xdac17f958d2ee523a2206206994597c13d831ec7", "decimals": 6},
     "USDC": {"address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "decimals": 6},
 }
@@ -74,14 +80,17 @@ def fetch_trades_page(sell_token, buy_token, last_timestamp=None, last_id=None):
     return query_subgraph(query).get("data", {}).get("trades", [])
 
 
-def fetch_all_trades(base, quote, base_decimals, quote_decimals, direction):
+def fetch_all_trades(base, quote, direction):
+    base_info = TOKENS[base]
+    quote_info = TOKENS[quote]
+
     all_trades = []
     last_timestamp, last_id = None, None
     page = 0
-    is_base_sell = direction.startswith("WBTC_TO_")
+    is_base_sell = direction.startswith(f"{base}_TO_")
 
-    sell_addr = TOKENS["WBTC"]["address"] if is_base_sell else TOKENS[quote]["address"]
-    buy_addr = TOKENS[quote]["address"] if is_base_sell else TOKENS["WBTC"]["address"]
+    sell_addr = base_info["address"] if is_base_sell else quote_info["address"]
+    buy_addr = quote_info["address"] if is_base_sell else base_info["address"]
 
     while True:
         page += 1
@@ -114,8 +123,8 @@ def fetch_all_trades(base, quote, base_decimals, quote_decimals, direction):
                     sell_usd,
                 )
 
-            base_amount = base_raw / Decimal(10**base_decimals)
-            quote_amount = quote_raw / Decimal(10**quote_decimals)
+            base_amount = base_raw / Decimal(10 ** base_info["decimals"])
+            quote_amount = quote_raw / Decimal(10 ** quote_info["decimals"])
             price = quote_amount / base_amount if base_amount > 0 else Decimal(0)
 
             all_trades.append(
@@ -140,17 +149,17 @@ def fetch_all_trades(base, quote, base_decimals, quote_decimals, direction):
 
 
 def export_csv(trades, filename, base, quote):
+    b, q = base.lower(), quote.lower()
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
-        q = quote.lower()
         writer.writerow(
             [
                 "timestamp",
                 "direction",
-                "wbtc_amount",
+                f"{b}_amount",
                 f"{q}_amount",
-                f"effective_price_{q}_per_wbtc",
-                "wbtc_amount_usd",
+                f"effective_price_{q}_per_{b}",
+                f"{b}_amount_usd",
                 f"{q}_amount_usd",
                 "tx_hash",
                 "trade_id",
@@ -173,18 +182,12 @@ def export_csv(trades, filename, base, quote):
 
 
 def fetch_pair(base, quote):
-    base_info, quote_info = TOKENS[base], TOKENS[quote]
-
     print(f"Fetching {base} -> {quote}...")
-    fwd = fetch_all_trades(
-        base, quote, base_info["decimals"], quote_info["decimals"], f"{base}_TO_{quote}"
-    )
+    fwd = fetch_all_trades(base, quote, f"{base}_TO_{quote}")
     print(f"  Total: {len(fwd)}")
 
     print(f"Fetching {quote} -> {base}...")
-    rev = fetch_all_trades(
-        base, quote, base_info["decimals"], quote_info["decimals"], f"{quote}_TO_{base}"
-    )
+    rev = fetch_all_trades(base, quote, f"{quote}_TO_{base}")
     print(f"  Total: {len(rev)}")
 
     all_trades = fwd + rev
@@ -193,19 +196,32 @@ def fetch_pair(base, quote):
 
 
 def main():
-    pair = sys.argv[1].upper() if len(sys.argv) > 1 else "ALL"
+    args = [a.upper() for a in sys.argv[1:]]
 
-    if pair == "USDC":
-        pairs = [("WBTC", "USDC")]
-    elif pair == "USDT":
-        pairs = [("WBTC", "USDT")]
-    elif pair == "ALL":
-        pairs = [("WBTC", "USDT"), ("WBTC", "USDC")]
-    else:
-        print(f"Usage: uv run fetch_trades.py [USDT|USDC|ALL]")
+    if len(args) == 0:
+        print("Usage: uv run fetch_trades.py <BASE> [QUOTE]")
+        print("  uv run fetch_trades.py WBTC          # WBTC vs USDT+USDC")
+        print("  uv run fetch_trades.py WETH          # WETH vs USDT+USDC")
+        print("  uv run fetch_trades.py ETH           # native ETH vs USDT+USDC")
+        print("  uv run fetch_trades.py WETH USDT     # specific pair")
         sys.exit(1)
 
-    for base, quote in pairs:
+    base = args[0]
+    if base not in TOKENS:
+        print(f"Unknown token: {base}")
+        print(f"Available: {', '.join(TOKENS.keys())}")
+        sys.exit(1)
+
+    if len(args) >= 2:
+        quotes = [args[1]]
+    else:
+        quotes = ["USDT", "USDC"]
+
+    for quote in quotes:
+        if quote not in TOKENS:
+            print(f"Unknown token: {quote}")
+            continue
+
         print(f"\n{'=' * 50}")
         print(f"{base}<->{quote}")
         print(f"{'=' * 50}")
@@ -213,16 +229,14 @@ def main():
         trades = fetch_pair(base, quote)
 
         if trades:
-            oldest, newest = (
-                min(t.timestamp for t in trades),
-                max(t.timestamp for t in trades),
-            )
+            oldest = min(t.timestamp for t in trades)
+            newest = max(t.timestamp for t in trades)
             total_base = sum(t.base_amount for t in trades)
             total_quote = sum(t.quote_amount for t in trades)
             print(f"Range: {oldest.date()} to {newest.date()}")
             print(f"Volume: {total_base:.2f} {base} / {total_quote:,.0f} {quote}")
 
-        output = f"wbtc_{quote.lower()}_trades.csv"
+        output = f"{base.lower()}_{quote.lower()}_trades.csv"
         export_csv(trades, output, base, quote)
         print(f"Saved to {output}")
 
