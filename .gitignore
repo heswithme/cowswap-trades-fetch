@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+
+# Environment
+.env
+
+# Cache
+.ruff_cache
+
+# Data (regenerate with scripts)
+*.csv
