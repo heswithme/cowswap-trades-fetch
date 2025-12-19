@@ -1,58 +1,73 @@
 """
 Fetch historical trades from CoW Protocol subgraph.
 
-Usage: uv run fetch_trades.py <BASE> <QUOTE>
-       uv run fetch_trades.py WBTC          # WBTC vs USDT+USDC
-       uv run fetch_trades.py WETH          # WETH vs USDT+USDC
-       uv run fetch_trades.py ETH           # native ETH vs USDT+USDC
-       uv run fetch_trades.py WETH USDT     # specific pair
+Edit the configuration section below to choose which token pairs to fetch.
+
+Outputs one CSV per pair to `data/partial/`.
 """
 
 import csv
+import json
 import os
-import sys
-from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 
-load_dotenv()
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")
-SUBGRAPH_ID = "8mdwJG7YCSwqfxUbhCypZvoubeZcFVpCHb4zmHhvuKTD"
-SUBGRAPH_URL = (
-    f"https://gateway.thegraph.com/api/{GRAPH_API_KEY}/subgraphs/id/{SUBGRAPH_ID}"
-)
-
-TOKENS = {
-    "WBTC": {"address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", "decimals": 8},
-    "WETH": {"address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "decimals": 18},
-    "ETH": {"address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "decimals": 18},
-    "USDT": {"address": "0xdac17f958d2ee523a2206206994597c13d831ec7", "decimals": 6},
-    "USDC": {"address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "decimals": 6},
-}
+# TOKENS_A = ["wbtc", "cbbtc"]  # e.g. ["eth"], ["wbtc", "cbbtc"], ["weth"]
+TOKENS_A = ["eth", "weth"]
+TOKENS_B = ["usdc", "usdt"]  # quote tokens (stablecoins)
 
 PAGE_SIZE = 1000
 
+SUBGRAPH_ID = "8mdwJG7YCSwqfxUbhCypZvoubeZcFVpCHb4zmHhvuKTD"
 
-@dataclass
-class Trade:
-    id: str
-    timestamp: datetime
-    direction: str
-    base_amount: Decimal
-    quote_amount: Decimal
-    base_amount_usd: Decimal
-    quote_amount_usd: Decimal
-    effective_price: Decimal
-    tx_hash: str
+DATA_DIR = Path(__file__).resolve().parent / "data"
+PARTIAL_DIR = DATA_DIR / "partial"
+TOKEN_ADDRESSES_PATH = Path(__file__).resolve().parent / "token-addresses.json"
+
+# =============================================================================
+
+load_dotenv()
 
 
-def query_subgraph(query):
+def load_token_map(filepath):
+    with open(filepath) as f:
+        raw = json.load(f)
+
+    token_map = {}
+    for name, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        token_map[name.lower()] = {
+            "address": (info.get("address") or "").lower(),
+            "decimals": int(info.get("decimals")),
+        }
+    return token_map
+
+
+def get_token_info(token_map, token_name):
+    token = token_name.lower()
+    if token not in token_map:
+        raise KeyError(f"Token '{token_name}' missing from {TOKEN_ADDRESSES_PATH.name}")
+
+    info = token_map[token]
+    if not info.get("address"):
+        raise ValueError(
+            f"Token '{token_name}' has an empty address in {TOKEN_ADDRESSES_PATH.name}"
+        )
+    return info
+
+
+def query_subgraph(subgraph_url, query):
     response = httpx.post(
-        SUBGRAPH_URL,
+        subgraph_url,
         json={"query": query},
         headers={
             "Content-Type": "application/json",
@@ -67,7 +82,9 @@ def query_subgraph(query):
     return result
 
 
-def fetch_trades_page(sell_token, buy_token, last_timestamp=None, last_id=None):
+def fetch_trades_page(
+    subgraph_url, sell_token, buy_token, last_timestamp=None, last_id=None
+):
     where = f'sellToken_: {{address: "{sell_token}"}}, buyToken_: {{address: "{buy_token}"}}'
     if last_timestamp is not None and last_id is not None:
         where = f'{where}, timestamp_lte: {last_timestamp}, id_not: "{last_id}"'
@@ -77,25 +94,27 @@ def fetch_trades_page(sell_token, buy_token, last_timestamp=None, last_id=None):
         id timestamp sellAmount buyAmount sellAmountUsd buyAmountUsd txHash
     }} }}
     """
-    return query_subgraph(query).get("data", {}).get("trades", [])
+    return query_subgraph(subgraph_url, query).get("data", {}).get("trades", [])
 
 
-def fetch_all_trades(base, quote, direction):
-    base_info = TOKENS[base]
-    quote_info = TOKENS[quote]
+def fetch_all_trades(subgraph_url, token_map, base, quote, direction):
+    base_info = get_token_info(token_map, base)
+    quote_info = get_token_info(token_map, quote)
 
-    all_trades = []
+    trades_out = []
     last_timestamp, last_id = None, None
     page = 0
-    is_base_sell = direction.startswith(f"{base}_TO_")
 
+    is_base_sell = direction.startswith(f"{base.upper()}_TO_")
     sell_addr = base_info["address"] if is_base_sell else quote_info["address"]
     buy_addr = quote_info["address"] if is_base_sell else base_info["address"]
 
     while True:
         page += 1
         print(f"  Page {page} ({direction})...", end=" ", flush=True)
-        trades = fetch_trades_page(sell_addr, buy_addr, last_timestamp, last_id)
+        trades = fetch_trades_page(
+            subgraph_url, sell_addr, buy_addr, last_timestamp, last_id
+        )
 
         if not trades:
             print("done")
@@ -104,7 +123,8 @@ def fetch_all_trades(base, quote, direction):
 
         for t in trades:
             ts = datetime.fromtimestamp(int(t["timestamp"]))
-            sell_amt, buy_amt = Decimal(t["sellAmount"]), Decimal(t["buyAmount"])
+            sell_amt = Decimal(t["sellAmount"])
+            buy_amt = Decimal(t["buyAmount"])
             sell_usd = Decimal(t["sellAmountUsd"] or 0)
             buy_usd = Decimal(t["buyAmountUsd"] or 0)
 
@@ -127,30 +147,56 @@ def fetch_all_trades(base, quote, direction):
             quote_amount = quote_raw / Decimal(10 ** quote_info["decimals"])
             price = quote_amount / base_amount if base_amount > 0 else Decimal(0)
 
-            all_trades.append(
-                Trade(
-                    id=t["id"],
-                    timestamp=ts,
-                    direction=direction,
-                    base_amount=base_amount,
-                    quote_amount=quote_amount,
-                    base_amount_usd=base_usd,
-                    quote_amount_usd=quote_usd,
-                    effective_price=price,
-                    tx_hash=t["txHash"],
-                )
+            trades_out.append(
+                {
+                    "id": t["id"],
+                    "timestamp": ts,
+                    "direction": direction,
+                    "base_amount": base_amount,
+                    "quote_amount": quote_amount,
+                    "base_amount_usd": base_usd,
+                    "quote_amount_usd": quote_usd,
+                    "effective_price": price,
+                    "tx_hash": t["txHash"],
+                }
             )
 
         last_timestamp, last_id = int(trades[-1]["timestamp"]), trades[-1]["id"]
         if len(trades) < PAGE_SIZE:
             break
 
+    return trades_out
+
+
+def fetch_pair(subgraph_url, token_map, base, quote):
+    print(f"Fetching {base} -> {quote}...")
+    fwd = fetch_all_trades(
+        subgraph_url,
+        token_map,
+        base,
+        quote,
+        f"{base.upper()}_TO_{quote.upper()}",
+    )
+    print(f"  Total: {len(fwd)}")
+
+    print(f"Fetching {quote} -> {base}...")
+    rev = fetch_all_trades(
+        subgraph_url,
+        token_map,
+        base,
+        quote,
+        f"{quote.upper()}_TO_{base.upper()}",
+    )
+    print(f"  Total: {len(rev)}")
+
+    all_trades = fwd + rev
+    all_trades.sort(key=lambda t: t["timestamp"], reverse=True)
     return all_trades
 
 
-def export_csv(trades, filename, base, quote):
+def export_csv(trades, filepath, base, quote):
     b, q = base.lower(), quote.lower()
-    with open(filename, "w", newline="") as f:
+    with open(filepath, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
@@ -168,77 +214,61 @@ def export_csv(trades, filename, base, quote):
         for t in trades:
             writer.writerow(
                 [
-                    t.timestamp.isoformat(),
-                    t.direction,
-                    f"{t.base_amount:.8f}",
-                    f"{t.quote_amount:.6f}",
-                    f"{t.effective_price:.2f}",
-                    f"{t.base_amount_usd:.2f}",
-                    f"{t.quote_amount_usd:.2f}",
-                    t.tx_hash,
-                    t.id,
+                    t["timestamp"].isoformat(),
+                    t["direction"],
+                    f"{t['base_amount']:.8f}",
+                    f"{t['quote_amount']:.6f}",
+                    f"{t['effective_price']:.2f}",
+                    f"{t['base_amount_usd']:.2f}",
+                    f"{t['quote_amount_usd']:.2f}",
+                    t["tx_hash"],
+                    t["id"],
                 ]
             )
 
 
-def fetch_pair(base, quote):
-    print(f"Fetching {base} -> {quote}...")
-    fwd = fetch_all_trades(base, quote, f"{base}_TO_{quote}")
-    print(f"  Total: {len(fwd)}")
-
-    print(f"Fetching {quote} -> {base}...")
-    rev = fetch_all_trades(base, quote, f"{quote}_TO_{base}")
-    print(f"  Total: {len(rev)}")
-
-    all_trades = fwd + rev
-    all_trades.sort(key=lambda t: t.timestamp, reverse=True)
-    return all_trades
-
-
 def main():
-    args = [a.upper() for a in sys.argv[1:]]
+    graph_api_key = os.getenv("GRAPH_API_KEY")
+    if not graph_api_key:
+        raise SystemExit("Missing GRAPH_API_KEY (set it in .env)")
 
-    if len(args) == 0:
-        print("Usage: uv run fetch_trades.py <BASE> [QUOTE]")
-        print("  uv run fetch_trades.py WBTC          # WBTC vs USDT+USDC")
-        print("  uv run fetch_trades.py WETH          # WETH vs USDT+USDC")
-        print("  uv run fetch_trades.py ETH           # native ETH vs USDT+USDC")
-        print("  uv run fetch_trades.py WETH USDT     # specific pair")
-        sys.exit(1)
+    subgraph_url = (
+        f"https://gateway.thegraph.com/api/{graph_api_key}/subgraphs/id/{SUBGRAPH_ID}"
+    )
 
-    base = args[0]
-    if base not in TOKENS:
-        print(f"Unknown token: {base}")
-        print(f"Available: {', '.join(TOKENS.keys())}")
-        sys.exit(1)
+    token_map = load_token_map(TOKEN_ADDRESSES_PATH)
 
-    if len(args) >= 2:
-        quotes = [args[1]]
-    else:
-        quotes = ["USDT", "USDC"]
+    PARTIAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    for quote in quotes:
-        if quote not in TOKENS:
-            print(f"Unknown token: {quote}")
-            continue
+    for base in TOKENS_A:
+        for quote in TOKENS_B:
+            if base.lower() == quote.lower():
+                continue
 
-        print(f"\n{'=' * 50}")
-        print(f"{base}<->{quote}")
-        print(f"{'=' * 50}")
+            print(f"\n{'=' * 50}")
+            print(f"{base}<->{quote}")
+            print(f"{'=' * 50}")
 
-        trades = fetch_pair(base, quote)
+            try:
+                _ = get_token_info(token_map, base)
+                _ = get_token_info(token_map, quote)
+            except (KeyError, ValueError) as e:
+                print(f"Skipping {base}<->{quote}: {e}")
+                continue
 
-        if trades:
-            oldest = min(t.timestamp for t in trades)
-            newest = max(t.timestamp for t in trades)
-            total_base = sum(t.base_amount for t in trades)
-            total_quote = sum(t.quote_amount for t in trades)
-            print(f"Range: {oldest.date()} to {newest.date()}")
-            print(f"Volume: {total_base:.2f} {base} / {total_quote:,.0f} {quote}")
+            trades = fetch_pair(subgraph_url, token_map, base, quote)
 
-        output = f"{base.lower()}_{quote.lower()}_trades.csv"
-        export_csv(trades, output, base, quote)
-        print(f"Saved to {output}")
+            if trades:
+                oldest = min(t["timestamp"] for t in trades)
+                newest = max(t["timestamp"] for t in trades)
+                total_base = sum(t["base_amount"] for t in trades)
+                total_quote = sum(t["quote_amount"] for t in trades)
+                print(f"Range: {oldest.date()} to {newest.date()}")
+                print(f"Volume: {total_base:.2f} {base} / {total_quote:,.0f} {quote}")
+
+            output_path = PARTIAL_DIR / f"{base.lower()}-{quote.lower()}.csv"
+            export_csv(trades, output_path, base, quote)
+            print(f"Saved to {output_path}")
 
 
 if __name__ == "__main__":

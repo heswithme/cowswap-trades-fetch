@@ -1,6 +1,6 @@
 # CoW Protocol Trade Fetcher
 
-Fetch historical WBTC and WETH trades from [CoW Protocol](https://cow.fi) via TheGraph subgraph.
+Fetch historical trades from [CoW Protocol](https://cow.fi) via TheGraph subgraph.
 
 ## Setup
 
@@ -12,49 +12,38 @@ echo "GRAPH_API_KEY=your_key_here" > .env
 uv sync
 ```
 
+## Configuration
+
+All parameters live in the script headers:
+
+- `fetch_trades.py`: edit `TOKENS_A` and `TOKENS_B` to pick pairs to fetch
+- `merge_trades.py`: edit `ASSET_GROUPS` and `TOKENS_B` to pick which partial files to merge
+
+Token addresses/decimals live in `token-addresses.json`.
+
 ## Usage
 
 ```bash
-# Fetch WBTC trades
-uv run fetch_trades.py WBTC          # WBTC vs USDT+USDC
-uv run fetch_trades.py WBTC USDT     # WBTC vs USDT only
-uv run fetch_trades.py WBTC USDC     # WBTC vs USDC only
+# Fetch all A-B combinations into data/partial/
+uv run fetch_trades.py
 
-# Fetch WETH trades  
-uv run fetch_trades.py WETH          # WETH vs USDT+USDC
-uv run fetch_trades.py WETH USDT     # WETH vs USDT only
-uv run fetch_trades.py WETH USDC     # WETH vs USDC only
-
-# Merge into single file
+# Merge partial files into data/<asset>usd.csv (e.g. data/btcusd.csv)
 uv run merge_trades.py
-```
-
-## Configuration
-
-Edit `merge_trades.py` to configure:
-
-```python
-CRYPTO = "WBTC"        # "WBTC" or "WETH"
-START_DATE = None      # e.g., "2024-01-01"
-END_DATE = None        # e.g., "2024-12-31"  
-MIN_VOLUME_USD = 100   # minimum trade size
 ```
 
 ## Output
 
-**Raw fetch files:**
-- `wbtc_usdt_trades.csv`, `wbtc_usdc_trades.csv`
-- `weth_usdt_trades.csv`, `weth_usdc_trades.csv`
+**Raw (per-pair) files:**
+- `data/partial/<tokenA>-<tokenB>.csv` (e.g. `data/partial/eth-usdc.csv`)
 
-**Merged files:**
-- `btcusd-cowswap.csv` (when CRYPTO="WBTC")
-- `ethusd-cowswap.csv` (when CRYPTO="WETH")
+**Merged (per-asset) files:**
+- `data/<asset>usd.csv` (e.g. `data/btcusd.csv`)
 
-Columns:
+Merged columns:
 - `unix_timestamp` - epoch time
 - `date` - human readable
 - `direction` - BUY (USD→crypto) or SELL (crypto→USD)
-- `wbtc_amount` or `weth_amount` - crypto amount
+- `<asset>_amount` - crypto amount
 - `usd_amount`, `price` - stablecoin amount and price
 - `total_usd_volume` - trade size in USD
-- `source` - USDT or USDC
+- `source` - usdt or usdc
